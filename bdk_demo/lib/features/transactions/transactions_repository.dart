@@ -1,3 +1,5 @@
+import 'dart:isolate';
+
 import 'package:bdk_dart/bdk.dart' as bdk;
 import 'package:bdk_demo/features/transactions/models/transaction_history_item.dart';
 import 'package:bdk_demo/features/transactions/transaction_history_mapper.dart';
@@ -5,14 +7,16 @@ import 'package:bdk_demo/providers/wallet_providers.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 abstract interface class TransactionsRepository {
+  bool isAvailableForWallet(String? walletId);
   Future<List<TransactionHistoryItem>> loadTransactions();
   Future<TransactionHistoryItem?> loadTransactionByTxid(String txid);
 }
 
 final transactionsRepositoryProvider = Provider<TransactionsRepository>((ref) {
-  final wallet = ref.watch(activeWalletProvider);
+  final binding = ref.watch(activeWalletBindingProvider);
   return WalletTransactionsRepository(
-    source: wallet == null ? null : BdkWalletTransactionSource(wallet),
+    walletId: binding?.walletId,
+    source: binding == null ? null : BdkWalletTransactionSource(binding.wallet),
   );
 });
 
@@ -37,17 +41,26 @@ class TransactionHistoryRecord {
 }
 
 class WalletTransactionsRepository implements TransactionsRepository {
-  WalletTransactionsRepository({required TransactionHistorySource? source})
-    : _source = source;
+  WalletTransactionsRepository({
+    required String? walletId,
+    required TransactionHistorySource? source,
+  }) : _walletId = walletId,
+       _source = source;
 
+  final String? _walletId;
   final TransactionHistorySource? _source;
+
+  @override
+  bool isAvailableForWallet(String? walletId) =>
+      walletId != null && walletId == _walletId && _source != null;
 
   @override
   Future<List<TransactionHistoryItem>> loadTransactions() async {
     final source = _source;
     if (source == null) return const [];
 
-    return source.transactions().map(_mapRecord).toList(growable: false);
+    final records = await Isolate.run(source.transactions);
+    return records.map(_mapRecord).toList(growable: false);
   }
 
   @override
@@ -55,8 +68,12 @@ class WalletTransactionsRepository implements TransactionsRepository {
     final source = _source;
     if (source == null) return null;
 
-    final record = source.transactionByTxid(txid);
-    return record == null ? null : _mapRecord(record);
+    final directRecord = source.transactionByTxid(txid);
+    if (directRecord != null) return _mapRecord(directRecord);
+
+    final records = await Isolate.run(source.transactions);
+    final fallbackRecord = _findTransactionByTxid(records, txid);
+    return fallbackRecord == null ? null : _mapRecord(fallbackRecord);
   }
 
   TransactionHistoryItem _mapRecord(TransactionHistoryRecord record) {
@@ -97,20 +114,13 @@ class BdkWalletTransactionSource implements TransactionHistorySource {
 
   @override
   TransactionHistoryRecord? transactionByTxid(String txid) {
+    final parsedTxid = bdk.Txid.fromString(hex: txid);
     try {
-      final parsedTxid = bdk.Txid.fromString(hex: txid);
-      try {
-        final canonicalTx = _wallet.getTx(txid: parsedTxid);
-        if (canonicalTx != null) return _recordFromCanonicalTx(canonicalTx);
-      } finally {
-        parsedTxid.dispose();
-      }
-    } catch (_) {
-      // If the txid cannot be parsed or fetched directly, fall back to the
-      // wallet transaction list so the detail page still behaves gracefully.
+      final canonicalTx = _wallet.getTx(txid: parsedTxid);
+      return canonicalTx == null ? null : _recordFromCanonicalTx(canonicalTx);
+    } finally {
+      parsedTxid.dispose();
     }
-
-    return _findTransactionByTxid(transactions(), txid);
   }
 
   TransactionHistoryRecord _recordFromCanonicalTx(bdk.CanonicalTx canonicalTx) {
@@ -141,9 +151,7 @@ class BdkWalletTransactionSource implements TransactionHistorySource {
           confirmationTime: position.confirmationBlockTime.confirmationTime,
         );
       } else if (position is bdk.UnconfirmedChainPosition) {
-        mappedPosition = UnconfirmedTransactionPosition(
-          timestamp: position.timestamp,
-        );
+        mappedPosition = const UnconfirmedTransactionPosition();
       } else {
         throw StateError('Unsupported transaction chain position: $position');
       }

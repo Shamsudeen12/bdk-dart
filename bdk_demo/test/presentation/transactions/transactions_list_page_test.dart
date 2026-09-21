@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:bdk_dart/bdk.dart' as bdk;
 import 'package:bdk_demo/features/transactions/models/transaction_history_item.dart';
 import 'package:bdk_demo/features/transactions/transaction_detail_page.dart';
+import 'package:bdk_demo/features/transactions/transactions_controller.dart';
 import 'package:bdk_demo/features/transactions/transactions_list_page.dart';
 import 'package:bdk_demo/features/transactions/transactions_repository.dart';
 import 'package:bdk_demo/models/wallet_record.dart';
@@ -25,6 +26,9 @@ class DelayedTransactionsRepository implements TransactionsRepository {
   DelayedTransactionsRepository(this.delayedResult);
 
   @override
+  bool isAvailableForWallet(String? walletId) => walletId != null;
+
+  @override
   Future<List<TransactionHistoryItem>> loadTransactions() async {
     return delayedResult;
   }
@@ -41,11 +45,17 @@ class DelayedTransactionsRepository implements TransactionsRepository {
 
 class MutableTransactionsRepository implements TransactionsRepository {
   List<TransactionHistoryItem> transactions;
+  Object? error;
 
   MutableTransactionsRepository(this.transactions);
 
   @override
+  bool isAvailableForWallet(String? walletId) => walletId != null;
+
+  @override
   Future<List<TransactionHistoryItem>> loadTransactions() async {
+    final currentError = error;
+    if (currentError != null) throw currentError;
     return transactions;
   }
 
@@ -102,6 +112,14 @@ Future<void> _pumpTransactionsFlow(
           activeWalletIdProvider.overrideWithValue(
             hasActiveWallet ? 'wallet-a' : null,
           ),
+          activeWalletBindingProvider.overrideWithValue(
+            hasActiveWallet
+                ? ActiveWalletBinding(
+                    walletId: 'wallet-a',
+                    wallet: FakeWallet(),
+                  )
+                : null,
+          ),
         ],
         child: MaterialApp.router(routerConfig: router),
       ),
@@ -131,6 +149,9 @@ void main() {
     expect(find.text('abcdef...7890'), findsOneWidget);
     expect(find.text('confirmed'), findsOneWidget);
     expect(find.text('pending'), findsOneWidget);
+    expect(find.text('Transaction History'), findsOneWidget);
+    expect(find.text('Load Transaction History'), findsNothing);
+    expect(find.text('Reload Transaction History'), findsNothing);
   });
 
   testWidgets(
@@ -160,6 +181,9 @@ void main() {
               FakeTransactionsRepository(transactions: transactionHistoryItems),
             ),
             activeWalletIdProvider.overrideWithValue('wallet-a'),
+            activeWalletBindingProvider.overrideWithValue(
+              ActiveWalletBinding(walletId: 'wallet-a', wallet: FakeWallet()),
+            ),
           ],
           child: MaterialApp.router(routerConfig: router),
         ),
@@ -222,7 +246,7 @@ void main() {
   });
 
   testWidgets(
-    'no active wallet shows the no-wallet state and disables load button',
+    'no active wallet shows the no-wallet state without a load button',
     (tester) async {
       await _pumpTransactionsFlow(
         tester,
@@ -238,13 +262,76 @@ void main() {
         findsOneWidget,
       );
 
-      final buttonFinder = find.widgetWithText(
-        FilledButton,
-        'Load Transaction History',
-      );
-      expect(tester.widget<FilledButton>(buttonFinder).onPressed, isNull);
+      expect(find.text('Load Transaction History'), findsNothing);
+      expect(find.text('Reload Transaction History'), findsNothing);
     },
   );
+
+  testWidgets(
+    'wallet record without an FFI wallet shows no-wallet state without a load button',
+    (tester) async {
+      final container = ProviderContainer(
+        overrides: [
+          transactionsRepositoryProvider.overrideWithValue(
+            FakeTransactionsRepository(transactions: const []),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      container
+          .read(activeWalletRecordProvider.notifier)
+          .set(
+            const WalletRecord(
+              id: 'wallet-a',
+              name: 'Wallet A',
+              network: WalletNetwork.testnet,
+              scriptType: ScriptType.p2wpkh,
+            ),
+          );
+
+      await _pumpTransactionsFlow(
+        tester,
+        repository: FakeTransactionsRepository(transactions: const []),
+        container: container,
+      );
+
+      expect(find.text('No active wallet'), findsOneWidget);
+      expect(find.text('Load Transaction History'), findsNothing);
+      expect(find.text('Reload Transaction History'), findsNothing);
+    },
+  );
+
+  testWidgets('shows a warning when a background refresh fails', (
+    tester,
+  ) async {
+    final repo = MutableTransactionsRepository(transactionHistoryItems);
+    final container = ProviderContainer(
+      overrides: [transactionsRepositoryProvider.overrideWithValue(repo)],
+    );
+    addTearDown(container.dispose);
+    container
+        .read(activeWalletRecordProvider.notifier)
+        .set(
+          const WalletRecord(
+            id: 'wallet-a',
+            name: 'Wallet A',
+            network: WalletNetwork.testnet,
+            scriptType: ScriptType.p2wpkh,
+          ),
+        );
+    container.read(activeWalletProvider.notifier).set(FakeWallet());
+
+    await _pumpTransactionsFlow(tester, repository: repo, container: container);
+    repo.error = Exception('Refresh failed');
+    await container
+        .read(transactionsControllerProvider('wallet-a').notifier)
+        .loadTransactions(isBackgroundRefresh: true);
+    await tester.pump();
+
+    expect(find.text('Transaction history may be out of date'), findsOneWidget);
+    expect(find.text('Refresh failed'), findsOneWidget);
+    expect(find.text('+42000 sat'), findsOneWidget);
+  });
 
   testWidgets(
     'switching logical active wallet ID from A to B clears A\'s transaction list and loads B\'s automatically',
@@ -286,20 +373,22 @@ void main() {
           confirmationTime: DateTime.now(),
         ),
       ];
+      final walletBTransactions = Completer<List<TransactionHistoryItem>>();
 
       container = ProviderContainer(
         overrides: [
           transactionsRepositoryProvider.overrideWith((ref) {
             final activeId = ref.watch(activeWalletIdProvider);
-            return FakeTransactionsRepository(
-              transactions: activeId == 'wallet-a' ? txsA : txsB,
-            );
+            return activeId == 'wallet-a'
+                ? FakeTransactionsRepository(transactions: txsA)
+                : DelayedTransactionsRepository(walletBTransactions.future);
           }),
         ],
       );
       addTearDown(container.dispose);
 
       container.read(activeWalletRecordProvider.notifier).set(recordA);
+      container.read(activeWalletProvider.notifier).set(FakeWallet());
 
       await _pumpTransactionsFlow(
         tester,
@@ -313,11 +402,17 @@ void main() {
 
       // Switch logical active wallet ID from A to B
       container.read(activeWalletRecordProvider.notifier).set(recordB);
-      await tester.pumpAndSettle();
+      container.read(activeWalletProvider.notifier).set(FakeWallet());
+      await tester.pump();
 
-      // Verify A's rows are gone, and B's rows loaded automatically without build-time exceptions
+      // Wallet A must disappear before wallet B's delayed load completes.
       expect(find.text('+10000 sat'), findsNothing);
       expect(find.textContaining('tx-a'), findsNothing);
+
+      walletBTransactions.complete(txsB);
+      await tester.pumpAndSettle();
+
+      // Verify B's rows load automatically without build-time exceptions.
       expect(find.text('+20000 sat'), findsOneWidget);
       expect(find.textContaining('tx-b'), findsOneWidget);
     },
@@ -424,6 +519,7 @@ void main() {
       addTearDown(container.dispose);
 
       container.read(activeWalletRecordProvider.notifier).set(recordA);
+      container.read(activeWalletProvider.notifier).set(FakeWallet());
 
       await _pumpTransactionsFlow(
         tester,
@@ -437,6 +533,7 @@ void main() {
 
       // Switch active wallet to B
       container.read(activeWalletRecordProvider.notifier).set(recordB);
+      container.read(activeWalletProvider.notifier).set(FakeWallet());
       await tester.pump();
 
       // Complete A's future
